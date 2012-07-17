@@ -30,12 +30,17 @@
 #include "prrts.h"
 #include "crc.h"
 
-#define FAST_HEAP_SIZE 256000
-#define USE_FAST_HEAP
+#define LOCAL_HEAP_SIZE 256000
 
+/*
+ * A single node in the RRT* tree.  The in_goal and config fields are
+ * constant.  The link field changes as the node is rewired to better
+ * paths.
+ */
 typedef struct prrts_node {
         struct prrts_link * volatile link;
-        void *_pad;
+        void *_pad; /* intel recommends 16-byte field alignment */
+
 #ifdef CHECK_CRCS
         uint32_t crc32;
 #endif
@@ -44,6 +49,12 @@ typedef struct prrts_node {
         const double *config;
 } prrts_node_t;
 
+/*
+ * A link between nodes in the RRT* tree.  Following the parent
+ * pointer repeatedly will walk a path back to the initial
+ * configuration--reversing the order will walk a path from the
+ * initial configuration to the target configuration.
+ */
 typedef struct prrts_link {
         struct prrts_node *node;
         struct prrts_link *parent;
@@ -58,10 +69,14 @@ typedef struct prrts_link {
         volatile ref_count;
 #endif
 
-        struct prrts_link * volatile first_child;
-        struct prrts_link * volatile next_sibling;
+        struct prrts_link * volatile first_child; /* linked list of children */
+        struct prrts_link * volatile next_sibling; /* next element in the list */
 } prrts_link_t;
 
+/*
+ * Data maintained per prrt run.  It contains the shared configuration
+ * and communication fields for the workers.
+ */
 typedef struct prrts_runtime {
         struct prrts_system *system;
         struct prrts_options *options;
@@ -84,20 +99,50 @@ typedef struct prrts_runtime {
         struct prrts_link * volatile best_path;
 } prrts_runtime_t;
 
+/*
+ * The near-list data structure built up during a call to kd_near
+ */
 typedef struct near_list {
         struct prrts_link * link;
         double link_cost;
         double path_cost;
 } near_list_t;
 
-#ifdef USE_FAST_HEAP
-typedef struct fast_heap {
-        struct fast_heap *prev;
-        int offset;
-        char data[FAST_HEAP_SIZE];
-} fast_heap_t;
-#endif
 
+/*
+ * The "local_heap" structure is a worker/thread-local heap used for
+ * allocating RRT* nodes, links and configurations.  We do large
+ * allocations of the local_heap and pointer arithmetic to allocate
+ * elements.  
+ *
+ * The "local_heap" serves the following purposes:
+ *
+ * - Allocations are fast (just some pointer arithmetic usually)
+ *
+ * - Calls to malloc are infrequent.  If malloc's implementation
+ *   serializes access, we remove the blocking overhead of it.
+ *
+ * - Clean-up after computation is simple--just free the local_heap
+ *   nodes.
+ *
+ * - Allows us to minimizes overhead of getting cache-aligned memory
+ *   blocks.
+ */
+typedef struct local_heap {
+        struct local_heap *prev;
+        int offset;
+        char data[LOCAL_HEAP_SIZE];
+} local_heap_t;
+
+/*
+ * A worker struct is a per-worker-thread allocated structure.  It is
+ * essentially a thread-local storage structure that contains
+ * everything a worker-thread needs to do its share of the
+ * computation.  An alternate approach would be to use
+ * pthread_setspecific, etc..., but this approach allows use to adapt
+ * to other threading implementations without reliance on the pthread
+ * API.
+ */
 typedef struct worker {
         pthread_t thread_id;
 
@@ -114,11 +159,11 @@ typedef struct worker {
 
         const double *sample_min;
         const double *sample_max;
-#ifdef USE_FAST_HEAP
-        fast_heap_t *config_heap;
-        fast_heap_t *node_heap;
-        fast_heap_t *link_heap;
-#endif
+
+        local_heap_t *config_heap;
+        local_heap_t *node_heap;
+        local_heap_t *link_heap;
+
         long clear_count;
         long sample_count;
         double link_dist_sum;
@@ -130,15 +175,13 @@ typedef struct worker {
         count_stats_t near_list_size_stats;
 } worker_t;
 
-#ifdef USE_FAST_HEAP
-
-static fast_heap_t *
-fast_heap_create(size_t align)
+static local_heap_t *
+local_heap_create(size_t align)
 {
-        fast_heap_t *heap;
+        local_heap_t *heap;
 
-        if ((heap = malloc(sizeof(fast_heap_t))) == NULL)
-                err(1, "failed to allocate fast_heap");
+        if ((heap = malloc(sizeof(local_heap_t))) == NULL)
+                err(1, "failed to allocate local_heap");
 
         heap->prev = NULL;
         heap->offset = aligned_offset(heap->data, align);
@@ -146,24 +189,36 @@ fast_heap_create(size_t align)
         return heap;
 }
 
+static void
+local_heap_free(local_heap_t *heap)
+{
+        local_heap_t *prev;
+
+        while (heap != NULL) {
+                prev = heap->prev;
+                free(heap);
+                heap = prev;
+        }
+}
+
 static void *
-fast_alloc(fast_heap_t **fast_heap, size_t size, size_t align)
+local_alloc(local_heap_t **local_heap, size_t size, size_t align)
 {
         size_t aligned_size = ALIGN_UP(size, align);
-        fast_heap_t *fh = *fast_heap;
+        local_heap_t *fh = *local_heap;
         int old_offset = fh->offset;
         int new_offset = old_offset + aligned_size;
         void *ptr;
 
-        assert(size < FAST_HEAP_SIZE);
+        assert(size < LOCAL_HEAP_SIZE);
 
-        if (new_offset >= FAST_HEAP_SIZE) {
-                if ((fh = malloc(sizeof(fast_heap_t))) == NULL)
-                        err(1, "failed to allocate fast_heap block");
+        if (new_offset >= LOCAL_HEAP_SIZE) {
+                if ((fh = malloc(sizeof(local_heap_t))) == NULL)
+                        err(1, "failed to allocate local_heap block");
 
                 /* printf("%d: new heap\n", worker->thread_no); */
-                fh->prev = *fast_heap;
-                *fast_heap = fh;
+                fh->prev = *local_heap;
+                *local_heap = fh;
 
                 old_offset = aligned_offset(fh->data, align);
                 new_offset = old_offset + aligned_size;
@@ -177,9 +232,6 @@ fast_alloc(fast_heap_t **fast_heap, size_t size, size_t align)
 
         return ptr;
 }
-#else
-#define fast_alloc(worker, size, align) malloc(size)
-#endif
 
 static void
 random_sample(worker_t *worker, double *config)
@@ -302,7 +354,7 @@ worker_near_callback(void *worker_arg, int no, void *near_node, double dist)
         /* check if we need to grow the array */
         if (no == worker->near_list_capacity) {
                 /*
-                 * we're not using "fast_alloc" here since this
+                 * we're not using "local_alloc" here since this
                  * reallocation is relatively infrequent, and it
                  * allows us to make use of realloc.
                  */
@@ -332,7 +384,7 @@ create_link(worker_t *worker, prrts_node_t *node, double link_cost, prrts_link_t
 
         assert(link_cost > 0);
 
-        if ((new_link = (prrts_link_t*)fast_alloc(&worker->link_heap, sizeof(prrts_link_t), CACHE_LINE_SIZE)) == NULL)
+        if ((new_link = (prrts_link_t*)local_alloc(&worker->link_heap, sizeof(prrts_link_t), CACHE_LINE_SIZE)) == NULL)
                 err(1, "failed to create link");
 
         new_link->node = node;
@@ -380,7 +432,7 @@ create_node(worker_t *worker, double *config, size_t dimensions, bool in_goal, d
         prrts_node_t *new_node;
         prrts_link_t *link;
 
-        if ((new_node = fast_alloc(&worker->node_heap, sizeof(prrts_node_t), CACHE_LINE_SIZE/2)) == NULL)
+        if ((new_node = local_alloc(&worker->node_heap, sizeof(prrts_node_t), CACHE_LINE_SIZE/2)) == NULL)
                 err(1, "failed to create node");
         
         /* memcpy(new_node->config, config, sizeof(double) * dimensions); */
@@ -840,11 +892,9 @@ worker_main(void *arg)
         size_t dimensions = runtime->system->dimensions;
         int step_no;
 
-#ifdef USE_FAST_HEAP
-        worker->config_heap = fast_heap_create(CACHE_LINE_SIZE/2);
-        worker->node_heap = fast_heap_create(CACHE_LINE_SIZE/2);
-        worker->link_heap = fast_heap_create(CACHE_LINE_SIZE);
-#endif
+        worker->config_heap = local_heap_create(CACHE_LINE_SIZE/2);
+        worker->node_heap = local_heap_create(CACHE_LINE_SIZE/2);
+        worker->link_heap = local_heap_create(CACHE_LINE_SIZE);
 
         worker->sample_count = 0;
         worker->clear_count = 0;
@@ -856,7 +906,7 @@ worker_main(void *arg)
         time_stats_clear(&worker->update_time);
         count_stats_clear(&worker->near_list_size_stats);
 
-        worker->new_config = fast_alloc(&worker->config_heap, sizeof(double) * dimensions, CACHE_LINE_SIZE/2);
+        worker->new_config = local_alloc(&worker->config_heap, sizeof(double) * dimensions, CACHE_LINE_SIZE/2);
 
         step_no = __sync_get(&runtime->step_no);
 
@@ -867,7 +917,7 @@ worker_main(void *arg)
                 if (worker_step(worker, step_no)) {
                         worker->clear_count++;
 
-                        worker->new_config = fast_alloc(&worker->config_heap, sizeof(double) * dimensions, CACHE_LINE_SIZE/2);
+                        worker->new_config = local_alloc(&worker->config_heap, sizeof(double) * dimensions, CACHE_LINE_SIZE/2);
 
                         /*
                          * Successfullly added a configuration, update
@@ -922,10 +972,12 @@ worker_main(void *arg)
 static prrts_solution_t *
 path_to_solution(prrts_system_t *system, prrts_link_t *path)
 {
+        size_t dimensions = system->dimensions;
         size_t n;
         int i;
         prrts_solution_t *s;
         prrts_link_t *ptr;
+        double *config_ptr;
 
         if (path == NULL) {
                 return NULL;
@@ -945,19 +997,25 @@ path_to_solution(prrts_system_t *system, prrts_link_t *path)
         if (system->target != NULL)
                 n++;
 
-        if ((s = malloc(sizeof(prrts_solution_t) + sizeof(double *) * n)) == NULL)
+        if ((s = malloc(sizeof(prrts_solution_t) + sizeof(double *) * n + sizeof(double) * dimensions * n)) == NULL)
                 err(1, "failed to create solution");
 
         s->path_cost = path->path_cost;
         s->path_length = n;
         
+        config_ptr = (void*)(&s->configs[dimensions]);
+
         i = n;
 
-        if (system->target != NULL)
-                s->configs[--i] = system->target;
+        if (system->target != NULL) {
+                s->configs[--i] = memcpy(config_ptr, system->target, sizeof(double) * dimensions);
+                config_ptr += dimensions;
+        }
 
-        for ( ptr = path ; ptr != NULL ; ptr = ptr->parent)
-                s->configs[--i] = ptr->node->config;
+        for ( ptr = path ; ptr != NULL ; ptr = ptr->parent) {
+                s->configs[--i] = memcpy(config_ptr, ptr->node->config, sizeof(double) * dimensions);
+                config_ptr += dimensions;
+        }
 
         assert(i == 0);
 
@@ -1017,13 +1075,22 @@ prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, lo
         time_stats_t update_time;
         count_stats_t near_list_size_stats;
 
+        prrts_solution_t *solution;
+
+        int num_cpus;
 
 #ifdef SET_CPU_AFFINITY
 #ifdef __linux__
-        int num_cpus, cpu;
+        int cpu;
         cpu_set_t cpu_set;
 #endif
 #endif
+
+        num_cpus = get_num_procs();
+
+        if (num_cpus != -1 && thread_count > num_cpus)
+                printf("WARNING!  thread count (%d) exceeds CPU count (%d)\n",
+                       thread_count, num_cpus);
 
         /*
          * the "runtime" structure is shared by all workers to both
@@ -1145,9 +1212,6 @@ prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, lo
         pthread_attr_init(&pthread_attr);
 
 #if defined(SET_CPU_AFFINITY) && defined(__linux__)
-        num_cpus = get_num_procs();
-        printf("number of cpus = %d\n", num_cpus);
-
         cpu = 0; /* sched_getcpu() */
         /* printf("cpu = %d, size=%d\n", cpu, (int)sizeof(cpu_set_t)); */
 
@@ -1230,7 +1294,20 @@ prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, lo
         time_stats_print("update tm", &update_time);
         printf("\n");
 
-        return path_to_solution(system, runtime->best_path);
+        solution = path_to_solution(system, runtime->best_path);
+
+        for (i=0 ; i<thread_count ; ++i) {
+                free(workers[i].near_list);
+                local_heap_free(workers[i].link_heap);
+                local_heap_free(workers[i].node_heap);
+                local_heap_free(workers[i].config_heap);
+        }
+
+        free(root_node);
+        free(root_link);
+        free(workers);
+
+        return solution;
 }
 
 prrts_solution_t *
