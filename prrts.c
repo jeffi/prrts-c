@@ -38,8 +38,10 @@
  * paths.
  */
 typedef struct prrts_node {
-        struct prrts_link * volatile link;
-        void *_pad; /* intel recommends 16-byte field alignment */
+        union {
+                struct prrts_link * volatile link;
+                char _pad[16]; /* intel recommends 16-byte field alignment */
+        };
 
 #ifdef CHECK_CRCS
         uint32_t crc32;
@@ -78,24 +80,42 @@ typedef struct prrts_link {
  * and communication fields for the workers.
  */
 typedef struct prrts_runtime {
-        struct prrts_system *system;
-        struct prrts_options *options;
+        /*
+         * unchanging fields are first and padded to be in a separate
+         * cache-line than the changing fields
+         */
+        union {
+                struct {
+                        struct prrts_system *system;
+                        struct prrts_options *options;
 
-        kd_tree_t *kd_tree;
-        struct prrts_node *root;
+                        kd_tree_t *kd_tree;
+                        struct prrts_node *root;
 
-        size_t thread_count;
-        size_t sample_limit;
-        hrtimer_t time_limit;
-        hrtimer_t start_time;
+                        size_t thread_count;
+                        size_t sample_limit;
+                        hrtimer_t time_limit;
+                        hrtimer_t start_time;
+                };
+                char _pad1[CACHE_LINE_SIZE];
+        };
 
-        /* 64-byte alignment */
+        /*
+         * Runtime status fields, these are constantly modified and
+         * checked as more samples are added to the graph.
+         */
+        union {
+                struct {
+                        volatile size_t step_no;
+                        volatile bool done;
+                };
+                char _pad2[CACHE_LINE_SIZE];
+        };
 
-        volatile size_t step_no;
-        volatile bool done;
-
-        char __pad[CACHE_LINE_SIZE - sizeof(size_t) - sizeof(bool)];
-
+        /*
+         * The best path field, also modified often, but in a separate
+         * process.  It gets its own cache line too.
+         */
         struct prrts_link * volatile best_path;
 } prrts_runtime_t;
 
@@ -103,9 +123,9 @@ typedef struct prrts_runtime {
  * The near-list data structure built up during a call to kd_near
  */
 typedef struct near_list {
-        struct prrts_link * link;
-        double link_cost;
-        double path_cost;
+        struct prrts_link * link; /* link returned by kd_near */
+        double link_cost; /* distance from link's node to near node */
+        double path_cost; /* path distance through link to near node */
 } near_list_t;
 
 
