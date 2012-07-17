@@ -1,26 +1,29 @@
 #define SET_CPU_AFFINITY
 
-#ifdef SET_CPU_AFFINITY
-#ifdef __linux__ 
-#define _GNU_SOURCE
-#include <sched.h>
-#include <unistd.h>
-#include <sys/syscall.h>
-#elif defined(BSD) || defined(__APPLE__)
-#include <sys/param.h>
-#include <sys/sysctl.h>
-#endif
-#endif /* SET_CPU_AFFINITY */
+#ifdef _OPENMP
+# include <omp.h>
+#else
+# ifdef __linux__ 
+#  define _GNU_SOURCE
+#  include <sched.h>
+#  include <unistd.h>
+#  include <sys/syscall.h>
+# elif defined(BSD) || defined(__APPLE__)
+#  include <sys/param.h>
+#  include <sys/sysctl.h>
+# endif
+# include <pthread.h>
+#endif /* _OPENMP */
 
 #include <assert.h>
 #include <err.h>
 #include <limits.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include "kdtree.h"
 #include "alloc.h"
 #include "mt19937a.h"
@@ -86,9 +89,6 @@ typedef struct prrts_runtime {
          */
         union {
                 struct {
-                        struct prrts_system *system;
-                        struct prrts_options *options;
-
                         kd_tree_t *kd_tree;
                         struct prrts_node *root;
 
@@ -164,9 +164,16 @@ typedef struct local_heap {
  * API.
  */
 typedef struct worker {
+#ifdef _OPENMP
+        int thread_id;
+#else
         pthread_t thread_id;
+#endif
 
         struct prrts_runtime *runtime;
+        struct prrts_system *system;
+        struct prrts_options *options;
+
         int thread_no;
         void *system_data;
         mt19937a_t rnd;
@@ -256,7 +263,7 @@ local_alloc(local_heap_t **local_heap, size_t size, size_t align)
 static void
 random_sample(worker_t *worker, double *config)
 {
-        size_t dimensions = worker->runtime->system->dimensions;
+        size_t dimensions = worker->system->dimensions;
         int i;
 
         for (i=dimensions ; --i>=0 ; ) {
@@ -504,7 +511,7 @@ can_link(worker_t *worker, const double *a, const double *b, double link_cost)
         worker->link_dist_sum += link_cost;
 
         time_stats_start(&worker->link_time);
-        r = (worker->runtime->system->link_func)(worker->system_data, a, b);
+        r = (worker->system->link_func)(worker->system_data, a, b);
         time_stats_stop(&worker->link_time);
 
         return r;
@@ -515,7 +522,7 @@ update_best_path(worker_t *worker, prrts_link_t *link, double radius)
 {
         prrts_node_t *node;
         double link_dist_to_goal;
-        prrts_system_t *system = worker->runtime->system;
+        prrts_system_t *system = worker->system;
         prrts_link_t *best_path;
         double best_dist;
         double dist_to_target;
@@ -644,7 +651,7 @@ rewire(worker_t *worker, prrts_link_t *old_link, double link_cost, prrts_node_t 
 
         node = old_link->node;
 
-        CRC32_CHECK(node, in_goal, config[worker->runtime->system->dimensions]);
+        CRC32_CHECK(node, in_goal, config[worker->system->dimensions]);
 
         parent_link = __sync_get(&new_parent->link);
 
@@ -746,7 +753,7 @@ steer(size_t dimensions, double *new_config, const double *target_config, double
 static bool
 worker_step(worker_t *worker, int step_no)
 {
-        prrts_system_t *system = worker->runtime->system;
+        prrts_system_t *system = worker->system;
         double radius;
         double nearest_dist, dist;
         int near_list_size;
@@ -761,9 +768,9 @@ worker_step(worker_t *worker, int step_no)
         if (!(system->clear_func)(worker->system_data, new_config))
                 return false;
 
-        radius = worker->runtime->options->gamma *
+        radius = worker->options->gamma *
                 pow(log((double)step_no + 1.0) / (double)(step_no + 1.0),
-                    1.0 / (double)worker->runtime->system->dimensions);
+                    1.0 / (double)worker->system->dimensions);
 
         assert(radius > 0.0);
 
@@ -903,18 +910,58 @@ worker_step(worker_t *worker, int step_no)
         return false;
 }
 
+static void
+create_worker_system_data(worker_t *worker)
+{
+        prrts_runtime_t *runtime = worker->runtime;
+        prrts_system_t *system = worker->system;
+        double *sample_min;
+        double *sample_max;
+        double min, t;
+        int thread_no = worker->thread_no;
+        int thread_count = runtime->thread_count;
+
+        if (!worker->options->regional_sampling) {
+                worker->sample_min = system->min;
+                worker->sample_max = system->max;
+        } else {
+                sample_min = array_copy(system->min, system->dimensions);
+                sample_max = array_copy(system->max, system->dimensions);
+
+                min = system->min[REGION_SPLIT_AXIS];
+                t = (system->max[REGION_SPLIT_AXIS] - min) / thread_count;
+                sample_min[REGION_SPLIT_AXIS] = min + thread_no * t;
+                if (thread_no+1 < thread_count) {
+                        sample_max[REGION_SPLIT_AXIS] = min + (thread_no+1) * t;
+                }
+
+                worker->sample_min = sample_min;
+                worker->sample_max = sample_max;
+        }
+
+        worker->system_data = (system->system_data_alloc_func)(
+                thread_no, worker->sample_min, worker->sample_max);
+}
+
 static void *
 worker_main(void *arg)
 {
         worker_t *worker = (worker_t*)arg;
         bool is_main_thread = (worker->thread_no == 0);
         prrts_runtime_t *runtime = worker->runtime;
-        size_t dimensions = runtime->system->dimensions;
+        prrts_system_t *system = worker->system;
+        size_t dimensions = system->dimensions;
         int step_no;
+
+        worker->near_list = malloc(sizeof(near_list_t) * INITIAL_NEAR_LIST_CAPACITY);
+        worker->near_list_size = 0;
+        worker->near_list_capacity = INITIAL_NEAR_LIST_CAPACITY;
 
         worker->config_heap = local_heap_create(CACHE_LINE_SIZE/2);
         worker->node_heap = local_heap_create(CACHE_LINE_SIZE/2);
         worker->link_heap = local_heap_create(CACHE_LINE_SIZE);
+
+        create_worker_system_data(worker);
 
         worker->sample_count = 0;
         worker->clear_count = 0;
@@ -1042,7 +1089,9 @@ path_to_solution(prrts_system_t *system, prrts_link_t *path)
         return s;
 }
 
-#ifdef SET_CPU_AFFINITY
+#ifdef _OPENMP
+#define get_num_procs() omp_get_max_threads()
+#else
 static int
 get_num_procs()
 {
@@ -1073,161 +1122,42 @@ get_num_procs()
         return -1;
 #endif
 }
-#endif /* SET_CPU_AFFINITY */
+#endif /* _OPENMP */
 
-static prrts_solution_t *
-prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, long duration, size_t sample_count)
+
+/*
+ * This function starts up thread_count-1 worker threads and runs one
+ * of the worker processes on the calling thread.  If compiled with
+ * OpenMP, an omp pragma is used to start the threads, otherwise
+ * pthreads is used.  The openmp startup code is significantly shorter
+ * than the pthread version.
+ */
+static void
+start_workers(worker_t *workers, int thread_count)
 {
-        char runtime_alloc[sizeof(prrts_runtime_t) + CACHE_LINE_SIZE];
-        prrts_runtime_t *runtime;
-        prrts_node_t *root_node;
-        prrts_link_t *root_link;
+#ifdef _OPENMP
+        int i;
+
+#pragma omp parallel for num_threads(thread_count) schedule(static,1) private(i)
+        for (i=0 ; i<thread_count ; ++i) {
+                worker_main(&workers[i]);
+        }
+
+        /*
+         * that's all for the open mp version.  the parallel pragma
+         * includes memory barriers
+         */
+
+#else /* _OPENMP */
+
+        int i;
         pthread_attr_t pthread_attr;
-        worker_t *workers;
-        double *sample_min;
-        double *sample_max;
-        unsigned i;
         int error;
-
-        double link_dist_sum;
-        time_stats_t link_time;
-        time_stats_t near_time;
-        time_stats_t update_time;
-        count_stats_t near_list_size_stats;
-
-        prrts_solution_t *solution;
-
-        int num_cpus;
-
-#ifdef SET_CPU_AFFINITY
-#ifdef __linux__
+#if defined(SET_CPU_AFFINITY) && defined(__linux__)
+        int num_cpus = get_num_procs();
         int cpu;
         cpu_set_t cpu_set;
 #endif
-#endif
-
-        num_cpus = get_num_procs();
-
-        if (num_cpus != -1 && thread_count > num_cpus)
-                printf("WARNING!  thread count (%d) exceeds CPU count (%d)\n",
-                       thread_count, num_cpus);
-
-        /*
-         * the "runtime" structure is shared by all workers to both
-         * communicate system configuration and runtime state.
-         */
-        runtime = (prrts_runtime_t*)ALIGN_UP(runtime_alloc, CACHE_LINE_SIZE);
-
-        assert((((size_t)(&runtime->step_no)) & (CACHE_LINE_SIZE-1)) == 0);
-        assert((((size_t)(&runtime->best_path)) & (CACHE_LINE_SIZE-1)) == 0);
-
-        assert(system != NULL);
-        assert(system->dimensions > 0);
-
-        assert(options != NULL);
-        assert(options->gamma > 0);
-        assert(options->samples_per_step >= 1);
-
-        assert(thread_count > 0);
-
-        runtime->system = system;
-        runtime->options = options;
-        runtime->thread_count = thread_count;
-        runtime->time_limit = 0;
-        runtime->sample_limit = sample_count;
-
-        runtime->best_path = NULL;
-        runtime->step_no = 1;
-        runtime->done = false;
-
-        if ((root_node = malloc(sizeof(prrts_node_t))) == NULL)
-                err(1, "failed to create root_node");
-
-        if ((root_link = malloc(sizeof(prrts_link_t))) == NULL)
-                err(1, "failed to create root_link");
-
-        root_node->link = root_link;
-        root_node->in_goal = false;
-        root_node->config = system->init;
-        /* memcpy(root_node->config, system->init, sizeof(double) * system->dimensions); */
-        /* CRC32_SET(root_node, in_goal, config[system->dimensions]); */
-
-        root_link->node = root_node;
-        root_link->parent = NULL;
-        root_link->link_cost = 0.0;
-        root_link->path_cost = 0.0;
-        root_link->first_child = NULL;
-        root_link->next_sibling = NULL;
-        CRC32_SET(root_link, node, crc32);
-
-        runtime->root = root_node;
-        
-        runtime->kd_tree = kd_create_tree(
-                system->dimensions, system->min, system->max, system->dist_func,
-                root_node->config, root_node);
-
-        printf("Starting up.  sizeof(node)=%d (%d), sizeof(config)=%d (%d), sizeof(link)=%d (%d), sizeof(kdnode)=%d, sizeof(void*)=%d\n",
-               (int)sizeof(prrts_node_t),
-               (int)ALIGN_UP(sizeof(prrts_node_t), CACHE_LINE_SIZE/2),
-               (int)(sizeof(double) * system->dimensions),
-               (int)ALIGN_UP(sizeof(double) * system->dimensions, sizeof(double)),
-               (int)sizeof(prrts_link_t),
-               (int)ALIGN_UP(sizeof(prrts_link_t), CACHE_LINE_SIZE),
-               (int)sizeof(kd_node_t),
-               (int)sizeof(void*));
-
-        /* start the clock */
-        runtime->start_time = hrtimer_get();
-
-        /*
-         * We use the sequence generated by srandom/random as a quick
-         * seed generator for the the thread-safe mersenne twister prng.
-         */
-        srandom(runtime->start_time);
-
-        if (duration > 0)
-                runtime->time_limit = runtime->start_time + duration;
-
-        if ((workers = malloc(sizeof(worker_t) * thread_count)) == NULL)
-                err(1, "failed to create workers array");
-
-        /*
-         * Set up the sampling regions for the
-         * worker threads.
-         */
-        for (i=0 ; i<thread_count ; ++i) {
-                /* TODO: some of the initialization can be moved to the
-                 * thread's main function to execute in parallel */
-                workers[i].runtime = runtime;
-                workers[i].thread_no = i;
-                mt19937a_init_genrand(&workers[i].rnd, random());
-                workers[i].near_list = malloc(sizeof(near_list_t) * INITIAL_NEAR_LIST_CAPACITY);
-                workers[i].near_list_size = 0;
-                workers[i].near_list_capacity = INITIAL_NEAR_LIST_CAPACITY;
-
-                if (!options->regional_sampling) {
-                        workers[i].sample_min = system->min;
-                        workers[i].sample_max = system->max;
-                } else {
-                        sample_min = array_copy(system->min, system->dimensions);
-                        sample_max = array_copy(system->max, system->dimensions);
-
-                        double min = system->min[REGION_SPLIT_AXIS];
-                        double t = (system->max[REGION_SPLIT_AXIS] - min) / thread_count;
-                        sample_min[REGION_SPLIT_AXIS] = min + i * t;
-                        if (i+1 < thread_count) {
-                                sample_max[REGION_SPLIT_AXIS] = min + (i+1) * t;
-                        }
-
-                        workers[i].sample_min = sample_min;
-                        workers[i].sample_max = sample_max;
-                }
-
-                workers[i].system_data = (runtime->system->system_data_alloc_func)(
-                        i, workers[i].sample_min, workers[i].sample_max);
-        }
-
-        __sync_synchronize();
 
         pthread_attr_init(&pthread_attr);
 
@@ -1244,8 +1174,10 @@ prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, lo
         CPU_CLR(cpu, &cpu_set);
 #endif
 
+        __sync_synchronize();
+
         /*
-         * Start the threads, worker[0] is run on this thread,
+         * Start the threads, worker[0] is run on the calling thread,
          * the rest get their own new threads.
          */
         for (i=1 ; i<thread_count ; ++i) {
@@ -1267,6 +1199,7 @@ prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, lo
 
         pthread_attr_destroy(&pthread_attr);
 
+        /* run worker 0 on the calling thread */
         worker_main(&workers[0]);
 
         /*
@@ -1278,10 +1211,134 @@ prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, lo
                         warn("join failed on worker %u", i);
         }
 
+        __sync_synchronize();
+
+#endif /* _OPENMP */
+
+}
+
+static prrts_solution_t *
+prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, long duration, size_t sample_count)
+{
+        char runtime_alloc[sizeof(prrts_runtime_t) + CACHE_LINE_SIZE];
+        char root_node_alloc[sizeof(prrts_node_t) + CACHE_LINE_SIZE];
+        char root_link_alloc[sizeof(prrts_link_t) + CACHE_LINE_SIZE];
+
+        prrts_runtime_t *runtime;
+        prrts_node_t *root_node;
+        prrts_link_t *root_link;
+
+        worker_t *workers;
+        int i;
+
+
+        double link_dist_sum;
+        time_stats_t link_time;
+        time_stats_t near_time;
+        time_stats_t update_time;
+        count_stats_t near_list_size_stats;
+
+        prrts_solution_t *solution;
+
+        int num_cpus;
+
+
+        /* check that the calling parameters are sane */
+        assert(system->dimensions > 0);
+        assert(options->gamma > 1);
+        assert(options->samples_per_step >= 1);
+        assert(thread_count > 0);
+
+        num_cpus = get_num_procs();
+        if (num_cpus != -1 && thread_count > num_cpus)
+                printf("WARNING!  thread count (%d) exceeds CPU count (%d)\n",
+                       thread_count, num_cpus);
+
+        /*
+         * the "runtime" structure is shared by all workers to both
+         * communicate system configuration and runtime state.  We use
+         * some pointer arithmetic to make sure that the
+         * stack-allocated data structures are aligned to cache lines.
+         */
+        runtime = (prrts_runtime_t*)ALIGN_UP(runtime_alloc, CACHE_LINE_SIZE);
+        root_node = (prrts_node_t*)ALIGN_UP(root_node_alloc, CACHE_LINE_SIZE);
+        root_link = (prrts_link_t*)ALIGN_UP(root_link_alloc, CACHE_LINE_SIZE);
+
+        /* check that our alignments are working */
+        assert((((size_t)&runtime->step_no) & (CACHE_LINE_SIZE-1)) == 0);
+        assert((((size_t)&runtime->best_path) & (CACHE_LINE_SIZE-1)) == 0);
+
+        /* initialize the shared runtime structure */
+        runtime->thread_count = thread_count;
+        runtime->time_limit = 0;
+        runtime->sample_limit = sample_count;
+        runtime->best_path = NULL;
+        runtime->step_no = 1;
+        runtime->done = false;
+
+        root_node->link = root_link;
+        root_node->in_goal = false;
+        root_node->config = system->init;
+
+        /* CRC32_SET(root_node, in_goal, config[system->dimensions]); */
+
+        root_link->node = root_node;
+        root_link->parent = NULL;
+        root_link->link_cost = 0.0;
+        root_link->path_cost = 0.0;
+        root_link->first_child = NULL;
+        root_link->next_sibling = NULL;
+
+        /* CRC32_SET(root_link, node, crc32); */
+
+        runtime->root = root_node;
+        
+        runtime->kd_tree = kd_create_tree(
+                system->dimensions, system->min, system->max, system->dist_func,
+                root_node->config, root_node);
+
+        printf("Starting up (" 
+#ifdef _OPENMP
+               "using OpenMP"
+#else
+               "using pthreads"
+#endif
+               ").  Configuration space is %d dimensions, Using %d threads.\n",
+               (int)system->dimensions,
+               (int)thread_count
+                );
+
+        /* start the clock */
+        runtime->start_time = hrtimer_get();
+
+        /*
+         * We use the sequence generated by srandom/random as a quick
+         * seed generator for the the thread-safe mersenne twister prng.
+         */
+        srandom(runtime->start_time);
+
+        if (duration > 0)
+                runtime->time_limit = runtime->start_time + duration;
+
+        if ((workers = malloc(sizeof(worker_t) * thread_count)) == NULL)
+                err(1, "failed to create workers array");
+
+        /*
+         * Set up the sampling regions for the
+         * worker threads.
+         */
+        for (i=0 ; i<thread_count ; ++i) {
+                workers[i].runtime = runtime;
+                workers[i].system = system;
+                workers[i].options = options;
+                workers[i].thread_no = i;
+                mt19937a_init_genrand(&workers[i].rnd, random());
+        }
+
+        start_workers(workers, thread_count);
+
         /* end_time (TODO) */
         hrtimer_get();
-
-        __sync_synchronize();
 
         link_dist_sum = 0.0;
         time_stats_clear(&link_time);
@@ -1321,10 +1378,13 @@ prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, lo
                 local_heap_free(workers[i].link_heap);
                 local_heap_free(workers[i].node_heap);
                 local_heap_free(workers[i].config_heap);
+
+                if (options->regional_sampling) {
+                        free((void*)workers[i].sample_min);
+                        free((void*)workers[i].sample_max);
+                }
         }
 
-        free(root_node);
-        free(root_link);
         free(workers);
 
         return solution;
