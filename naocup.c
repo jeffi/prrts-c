@@ -842,6 +842,35 @@ usage(char *prog_name)
         exit(1);
 }
 
+static void
+print_solution(prrts_solution_t *solution)
+{
+        int i, j;
+        double sum;
+
+        printf("angleList = [\\\n");
+        for (i=0 ; i<DIMENSIONS ; ++i) {
+                printf("  [ ");
+                for (j=1 ; j<solution->path_length ; ++j) {
+                        printf("%f, ", solution->configs[j][i]);
+                }
+                printf("], \\\n");
+        }
+        printf("]\n");
+        printf("times = [\\\n");
+        for (i=0 ; i<DIMENSIONS ; ++i) {
+                sum = 0.0;
+                printf("  [ ");
+                for (j=1 ; j<solution->path_length ; ++j) {
+                        sum += nao_dist(solution->configs[j-1], solution->configs[j]);
+                        printf("%f, ", sum);
+                }
+                printf("], \\\n");
+        }
+        printf("]\n");
+}
+
+
 int
 naocup_main(int argc, char *argv[])
 {
@@ -849,9 +878,8 @@ naocup_main(int argc, char *argv[])
         prrts_options_t options;
         prrts_solution_t *solution;
         long thread_count = 16;
-        int i, j, ch;
+        int ch;
         long sample_count = 2500;
-        double sum;
         hrtimer_t start_time;
         hrtimer_t duration;
         char *ep;
@@ -888,7 +916,6 @@ naocup_main(int argc, char *argv[])
 
         system = naocup_create_system();
 
-
         start_time = hrtimer_get();
         solution = prrts_run_for_samples(system, &options, thread_count, sample_count);
         duration = hrtimer_get() - start_time;
@@ -906,28 +933,7 @@ naocup_main(int argc, char *argv[])
                 printf("No solution found\n");
         } else {
                 printf("Solution found, length=%u, cost=%f\n", (unsigned)solution->path_length, solution->path_cost);
-#if 0
-                printf("angleList = [\\\n");
-                for (i=0 ; i<DIMENSIONS ; ++i) {
-                        printf("  [ ");
-                        for (j=1 ; j<solution->path_length ; ++j) {
-                                printf("%f, ", solution->configs[j][i]);
-                        }
-                        printf("], \\\n");
-                }
-                printf("]\n");
-                printf("times = [\\\n");
-                for (i=0 ; i<DIMENSIONS ; ++i) {
-                        sum = 0.0;
-                        printf("  [ ");
-                        for (j=1 ; j<solution->path_length ; ++j) {
-                                sum += nao_dist(solution->configs[j-1], solution->configs[j]);
-                                printf("%f, ", sum);
-                        }
-                        printf("], \\\n");
-                }
-                printf("]\n");
-#endif
+                print_solution(solution);
         }
 
         return 0;
