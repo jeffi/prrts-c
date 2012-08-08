@@ -1,6 +1,11 @@
 #ifndef ATOMIC_H
 #define ATOMIC_H
 
+#define smp_write_barrier() __sync_synchronize()
+#define smp_read_barrier() __sync_synchronize()
+#define smp_read_barrier_depends() ((void)0)
+#define smp_full_barrier() __sync_synchronize()
+
 
 /*
  * GCC does not expose a "__sync_get".  One option is to use a

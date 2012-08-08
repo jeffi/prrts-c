@@ -20,6 +20,31 @@
 #include <alloca.h>
 #endif
 
+#ifdef CHECK_CRCS
+static inline crc32_t
+compute_crc32_node(kd_node_t *node, size_t dimensions)
+{
+        crc32_t accum = CRC32_INIT;
+        crc32_accum(&accum, &node->value, sizeof(void *));
+        crc32_accum(&accum, &node->config[0], sizeof(double) * dimensions);
+        return crc32_finish(accum);
+}
+
+static inline void
+set_crc32_node(kd_node_t *node, size_t dimensions)
+{
+        node->crc32 = compute_crc32_node(node, dimensions);
+}
+
+#define check_crc32_node(node, dimensions) do {                         \
+                crc32_t __crc = compute_crc32_node(node, dimensions);   \
+                assert(__crc == node->crc32);                           \
+        } while (0)
+
+
+#else
+#endif
+
 kd_tree_t *
 kd_create_tree(size_t dimensions, const double *min, const double *max, kd_dist_func dist_func,
                const double *init, void *value)
@@ -56,12 +81,10 @@ kd_create_tree(size_t dimensions, const double *min, const double *max, kd_dist_
 
         root->config = init;
         root->value = value;
-        /* __sync_set(&root->a, NULL); */
-        /* __sync_set(&root->b, NULL); */
         root->a = NULL;
         root->b = NULL;
 
-        CRC32_SET(root, config, crc32);
+        set_crc32_node(root, dimensions);
 
         __sync_synchronize();
         
@@ -93,16 +116,13 @@ kd_insert(kd_tree_t *tree, const double *config, void *value)
 
         new_node->config = config;
         new_node->value = value;
-        /* __sync_set(&new_node->a, NULL); */
-        /* __sync_set(&new_node->b, NULL); */
         new_node->a = NULL;
         new_node->b = NULL;
 
-        CRC32_SET(new_node, config, crc32);
+        set_crc32_node(new_node, dimensions);
 
         /* make sure that new_node is available */
-        __sync_synchronize();
-        /* TODO: a full memory barrier is probably overkill here */
+        smp_write_barrier();
 
         for (;; ++depth) {
                 size_t axis = depth % dimensions;
@@ -112,8 +132,9 @@ kd_insert(kd_tree_t *tree, const double *config, void *value)
 
                 if (v < mp) {
                         /* a-side */
-                        a = __sync_get(&n->a);
+                        a = n->a;
                         if (a == NULL) {
+                                /* smp_read_barrier_depends() not needed since we CAS */
                                 actual = __sync_val_compare_and_swap(&n->a, NULL, new_node);
                                 if (actual == NULL) {
                                         break;
@@ -126,8 +147,9 @@ kd_insert(kd_tree_t *tree, const double *config, void *value)
                         max[axis] = mp;
                 } else {
                         /* b-side */
-                        b = __sync_get(&n->b);
+                        b = n->b;
                         if (b == NULL) {
+                                /* smp_read_barrier_depends() not needed since we CAS */
                                 actual = __sync_val_compare_and_swap(&n->b, NULL, new_node);
                                 if (actual == NULL) {
                                         break;
@@ -167,7 +189,7 @@ kd_nearest_impl(kd_nearest_t *t, kd_node_t *n, size_t axis)
         d = (t->tree->dist_func)(n->config, t->target);
 
         if (d < t->dist) {
-                CRC32_CHECK(n, config, crc32);
+                check_crc32_node(n, t->tree->dimensions);
                 t->dist = d;
                 t->nearest = n->value;
         }
@@ -176,7 +198,10 @@ kd_nearest_impl(kd_nearest_t *t, kd_node_t *n, size_t axis)
 
         if (t->target[axis] < mp) {
                 /* a-side */
-                a = __sync_get(&n->a);
+
+                smp_read_barrier_depends();
+
+                a = n->a;
                 if (a != NULL) {
                         tmp = t->max[axis];
                         t->max[axis] = mp;
@@ -184,7 +209,7 @@ kd_nearest_impl(kd_nearest_t *t, kd_node_t *n, size_t axis)
                         t->max[axis] = tmp;
                 }
 
-                b = __sync_get(&n->b);
+                b = n->b;
                 if (b != NULL) {
                         tmp = fabs(mp - t->target[axis]);
                         if (tmp < t->dist) {
@@ -196,7 +221,10 @@ kd_nearest_impl(kd_nearest_t *t, kd_node_t *n, size_t axis)
                 }
         } else {
                 /* b-side */
-                b = __sync_get(&n->b);
+
+                smp_read_barrier_depends();
+
+                b = n->b;
                 if (b != NULL) {
                         tmp = t->min[axis];
                         t->min[axis] = mp;
@@ -204,7 +232,7 @@ kd_nearest_impl(kd_nearest_t *t, kd_node_t *n, size_t axis)
                         t->min[axis] = tmp;
                 }
 
-                a = __sync_get(&n->a);
+                a = n->a;
                 if (a != NULL) {
                         tmp = fabs(mp - t->target[axis]);
                         if (tmp < t->dist) {
@@ -266,14 +294,14 @@ kd_near_impl(kd_near_t *t, kd_node_t *n, size_t axis)
         d = (t->tree->dist_func)(n->config, t->target);
 
         if (d < t->radius) {
-                CRC32_CHECK(n, config, crc32);
+                check_crc32_node(n, t->tree->dimensions);
                 (t->callback)(t->cb_data, t->count++, n->value, d);
         }
         
         mp = (t->min[axis] + t->max[axis]) / 2.0;
         dm = fabs(mp - t->target[axis]);
 
-        a = __sync_get(&n->a);
+        a = n->a;
         if (a != NULL && (t->target[axis] < mp || dm < t->radius)) {
                 /* in or near a-side */
                 tmp = t->max[axis];
@@ -282,7 +310,7 @@ kd_near_impl(kd_near_t *t, kd_node_t *n, size_t axis)
                 t->max[axis] = tmp;
         }
 
-        b = __sync_get(&n->b);
+        b = n->b;
         if (b != NULL && (mp <= t->target[axis] || dm < t->radius)) {
                 /* in or near b-side */
                 tmp = t->min[axis];

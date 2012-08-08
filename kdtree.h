@@ -7,6 +7,10 @@
 #include <stdint.h>
 #include "alloc.h"
 
+#ifdef CHECK_CRCS
+#include "crc.h"
+#endif
+
 typedef double (*kd_dist_func)(const double *a, const double *b);
 typedef void (*kd_near_callback)(void *data, int no, void *value, double dist);
 
@@ -15,7 +19,7 @@ typedef struct kd_node {
         void *value;
 
 #ifdef CHECK_CRCS
-        uint32_t crc32;
+        crc32_t crc32;
 #endif
 
         /* 

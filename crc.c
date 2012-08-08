@@ -65,7 +65,7 @@
 /*     hardware you could probably optimize the shift in assembler by  */
 /*     using byte-swap instructions.                                   */
 
-static const uint32_t crc32_table[] = { /* CRC polynomial 0xedb88320 */
+const uint32_t crc32_table[] = { /* CRC polynomial 0xedb88320 */
 0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f,
 0xe963a535, 0x9e6495a3, 0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988,
 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91, 0x1db71064, 0x6ab020f2,
@@ -110,37 +110,3 @@ static const uint32_t crc32_table[] = { /* CRC polynomial 0xedb88320 */
 0x54de5729, 0x23d967bf, 0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94,
 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
 };
-
-#define CRC32_UPDATE(octet, crc) (crc32_table[((crc) ^ (octet)) & 0xff] ^ ((crc) >> 8))
-
-uint32_t
-crc32_update(uint8_t ch, uint32_t crc)
-{
-        return CRC32_UPDATE(ch, crc);
-}
-
-uint32_t
-crc32(const void *buf, size_t len)
-{
-        uint32_t accum = 0xFFFFFFFF;
-        const uint8_t *ptr = buf;
-
-        for ( ; len; --len, ++ptr)
-                accum = CRC32_UPDATE(*ptr, accum);
-
-        return ~accum;
-}
-
-uint32_t
-crc32_range(const void *from, const void *to)
-{
-        uint32_t accum = 0xFFFFFFFF;
-        const uint8_t *ptr = from;
-
-        assert(from < to);
-
-        for ( ; ptr != to ; ptr++)
-                accum = CRC32_UPDATE(*ptr, accum);
-
-        return ~accum;
-}
