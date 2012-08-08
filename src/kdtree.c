@@ -43,6 +43,10 @@ set_crc32_node(kd_node_t *node, size_t dimensions)
 
 
 #else
+
+#define set_crc32_node(node, dimensions) do {} while (0)
+#define check_crc32_node(node, dimensions) do {} while (0)
+
 #endif
 
 kd_tree_t *

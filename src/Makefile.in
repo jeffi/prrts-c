@@ -1,0 +1,40 @@
+CC = @CC@
+CFLAGS = @CFLAGS@ @OPENMP_CFLAGS@
+LDFLAGS = @LDFLAGS@
+DEFS = @DEFS@
+DEPDIR = .deps
+
+
+top_builddir = @top_builddir@
+
+DEFAULT_INCLUDES = -I$(top_builddir)
+COMPILE = $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(CFLAGS)
+CCLD = $(CC)
+LINK = $(CCLD) $(CFLAGS) $(LDFLAGS) -o $@
+EXEEXT = @EXEEXT@
+
+SOURCES = main.c kdtree.c prrts.c mt19937a.c hrtimer.c alloc.c linear.c naocup.c collide.c crc.c stats.c
+OBJS = $(patsubst %.c,%.o,$(SOURCES))
+LIBS = -lm -lc -lpthread
+PROGRAM = prrts$(EXEEXT)
+
+.SUFFIXES:
+.SUFFIXES: .c .o .obj
+
+all:	Makefile $(PROGRAM)
+
+$(PROGRAM): $(OBJS)
+	@rm -f $(PROGRAM)
+	$(LINK) $(OBJS) $(LIBS)
+
+-include $(patsubst %.c,./$(DEPDIR)/%.Po,$(SOURCES))
+
+.c.o:
+	mkdir -p $(DEPDIR)
+	$(COMPILE) -MT $@ -MD -MP -MF $(DEPDIR)/$*.Tpo -c -o $@ $<
+	mv -f $(DEPDIR)/$*.Tpo $(DEPDIR)/$*.Po
+
+
+clean:
+	rm -f *.o $(PROGRAM)
+	rm -rf $(DEPDIR)
