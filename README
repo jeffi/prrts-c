@@ -52,5 +52,34 @@ memory access patterns.  This implementation may not run well on other
 SMP architectures.  If you are interested in testing/porting the code
 to run on another architecture, please contact the authors.
 
+______________________________________________________________________
+BUILDING
+
+Note: this build requires GNU make.  It make be available as "gmake"
+on your system, if "make" below does not work, then try "gmake" where
+it says "make".
+
+  % ./configure
+  % make
+
+Optionally you can specify after "./configure":
+
+  --disable-openmp   to use pthreads directly
+  --enable-crc       to enable runtime crc checking of data-structures
+
+If changing options, you should "make clean" before running make again.
+
+For example:
+
+  % ./configure --disable-openmp --enable-crc
+  % make clean
+  % make
+
+To run the example program:
+
+  % src/prrts -t4 -n20000 -r
+
+Runs (-n=)20000 samples with 4(-t)hreads with partitioned (-r)egional sampling.
+
 
 
