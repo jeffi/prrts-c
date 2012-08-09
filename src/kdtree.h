@@ -14,24 +14,6 @@
 typedef double (*kd_dist_func)(const double *a, const double *b);
 typedef void (*kd_near_callback)(void *data, int no, void *value, double dist);
 
-typedef struct kd_node {
-        const double *config;
-        void *value;
-
-#ifdef CHECK_CRCS
-        crc32_t crc32;
-#endif
-
-        /* 
-         * 'a' and 'b' are volatile pointers to child nodes.  The
-         * pointers themselves will change (once), not the values that
-         * they point to (e.g. this is not memory-mapped I/O), thus we
-         * must place the volatile keyword after the *, not before.
-         */
-        struct kd_node * volatile a;
-        struct kd_node * volatile b;
-} kd_node_t;
-
 typedef struct kd_tree {
         size_t dimensions;
         const double *min;

@@ -1,3 +1,5 @@
+#include <config.h>
+
 #define SET_CPU_AFFINITY
 
 #ifdef _OPENMP
@@ -262,6 +264,7 @@ local_heap_create(size_t align)
 
         heap->prev = NULL;
         heap->offset = aligned_offset(heap->data, align);
+        assert(heap->offset < align);
 
         return heap;
 }
@@ -298,6 +301,7 @@ local_alloc(local_heap_t **local_heap, size_t size, size_t align)
                 *local_heap = fh;
 
                 old_offset = aligned_offset(fh->data, align);
+                assert(old_offset < align);
                 new_offset = old_offset + aligned_size;
         }
 
@@ -306,6 +310,10 @@ local_alloc(local_heap_t **local_heap, size_t size, size_t align)
 
         /* make sure we're returing aligned pointers */
         assert((((size_t)ptr) & (align - 1)) == 0);
+
+        /* make sure the ptr we're returning is within the heap */
+        assert(((size_t)ptr) > ((size_t)fh));
+        assert(((size_t)ptr) + size < ((size_t)fh) + sizeof(local_heap_t));
 
         return ptr;
 }
@@ -1104,8 +1112,8 @@ path_to_solution(prrts_system_t *system, prrts_link_t *path)
 
         n = 0;
         for ( ptr = path ; ptr != NULL ; ptr = ptr->parent ) {
-                check_crc32_link(path);
-                check_crc32_node(path->node, dimensions);
+                check_crc32_link(ptr);
+                check_crc32_node(ptr->node, dimensions);
                 n++;
         }
 
@@ -1122,7 +1130,7 @@ path_to_solution(prrts_system_t *system, prrts_link_t *path)
         s->path_cost = path->path_cost;
         s->path_length = n;
         
-        config_ptr = (void*)(&s->configs[dimensions]);
+        config_ptr = (void*)(&s->configs[n]);
 
         i = n;
 
@@ -1364,6 +1372,10 @@ prrts_run(prrts_system_t *system, prrts_options_t *options, int thread_count, lo
                "using OpenMP"
 #else
                "using pthreads"
+#endif
+
+#ifdef CHECK_CRCS
+               ", checking crcs"
 #endif
                ").  Configuration space is %d dimensions, Using %d threads.\n",
                (int)system->dimensions,

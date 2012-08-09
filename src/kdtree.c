@@ -1,3 +1,4 @@
+#include <config.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
@@ -19,6 +20,26 @@
 #else
 #include <alloca.h>
 #endif
+
+
+typedef struct kd_node {
+        const double *config;
+        void *value;
+
+#ifdef CHECK_CRCS
+        crc32_t crc32;
+#endif
+
+        /* 
+         * 'a' and 'b' are volatile pointers to child nodes.  The
+         * pointers themselves will change (once), not the values that
+         * they point to (e.g. this is not memory-mapped I/O), thus we
+         * must place the volatile keyword after the *, not before.
+         */
+        struct kd_node * volatile a;
+        struct kd_node * volatile b;
+} kd_node_t;
+
 
 #ifdef CHECK_CRCS
 static inline crc32_t
